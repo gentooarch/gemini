@@ -18,7 +18,7 @@ ENDPOINT="https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:gener
 
 # 【修改点 1】将历史文件指向 /tmp 下的固定文件
 HISTORY_FILE="/tmp/gemini_chat_history.json"
-RESPONSE_FILE=$(mktemp)
+RESPONSE_FILE=$(mktemp /tmp/gemini_response.XXXXXX)
 
 # 【修改点 2】只有当文件不存在时才初始化，否则保留原有记录
 if [ ! -f "$HISTORY_FILE" ]; then
