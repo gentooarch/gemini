@@ -3,7 +3,10 @@
  运行环境: macOS 12.0+ 
  编译命令: 
  clang++ -fobjc-arc -framework Cocoa -framework Foundation -framework UniformTypeIdentifiers main.mm -o GeminiApp
- ./GeminiApp
+ 
+ 运行方式:
+ 1. 使用默认Key: ./GeminiApp
+ 2. 使用临时Key: ./GeminiApp 你的API_KEY_在这里
  ===========================================================================
  */
 
@@ -17,8 +20,8 @@
 // 1. 配置区域
 // ==========================================
 
-// [必填] 替换为你的 Gemini API Key
-const std::string API_KEY = "Key";
+// 默认 API Key (如果在命令行没提供，则使用这个)
+std::string g_apiKey = "key"; 
 
 const bool USE_PROXY = false;
 const std::string PROXY_HOST = "127.0.0.1";
@@ -90,15 +93,21 @@ public:
     NSRect frame = NSMakeRect(0, 0, 900, 700);
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     NSWindow *window = [[NSWindow alloc] initWithContentRect:frame styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    window.title = @"Native Gemini (Safe File Upload)";
+    window.title = @"Native Gemini (Command Line Key Support)";
     window.minSize = NSMakeSize(600, 500);
     [window center];
     
     self = [super initWithWindow:window];
     if (self) {
         [self setupUI];
+        [self showCurrentKeyInfo];
     }
     return self;
+}
+
+- (void)showCurrentKeyInfo {
+    NSString *info = (g_apiKey == "Key") ? @"[System] Using default API Key from code." : @"[System] Using API Key from command line.";
+    [self appendLog:info color:[NSColor systemGrayColor]];
 }
 
 - (void)setupUI {
@@ -159,28 +168,18 @@ public:
     [self appendLog:@"[System] Chat history cleared from RAM." color:[NSColor systemGrayColor]];
 }
 
-// ==========================================
-// 修复后的文件上传逻辑
-// ==========================================
 - (void)onUploadClicked {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseFiles = YES;
     panel.canChooseDirectories = NO;
 
     if (@available(macOS 12.0, *)) {
-        // 使用更稳妥的方式获取类型，避免直接使用可能未定义的常量
         NSMutableArray<UTType *> *types = [NSMutableArray array];
-        [types addObject:UTTypePlainText];   // .txt
-        [types addObject:UTTypeSourceCode];  // 代码类
-        [types addObject:UTTypeJSON];        // .json
-        
-        // 动态查找 Markdown 和 Log 类型，防止因常量未定义导致编译失败
+        [types addObject:UTTypePlainText];
+        [types addObject:UTTypeSourceCode];
+        [types addObject:UTTypeJSON];
         UTType *mdType = [UTType typeWithFilenameExtension:@"md"];
         if (mdType) [types addObject:mdType];
-        
-        UTType *logType = [UTType typeWithFilenameExtension:@"log"];
-        if (logType) [types addObject:logType];
-
         panel.allowedContentTypes = types;
     } else {
 #pragma clang diagnostic push
@@ -221,14 +220,17 @@ public:
 }
 
 - (void)callGeminiAPI {
-    if (API_KEY == "YOUR_API_KEY_HERE") {
-        [self appendLog:@"[Error] Please set your API_KEY in the code." color:[NSColor systemRedColor]];
+    // 检查 Key 是否有效
+    if (g_apiKey == "Key" || g_apiKey.empty()) {
+        [self appendLog:@"[Error] API Key not set. Please provide it via command line: ./GeminiApp YOUR_KEY" color:[NSColor systemRedColor]];
+        self.sendButton.enabled = YES;
         return;
     }
+
     self.sendButton.enabled = NO;
     self.uploadButton.enabled = NO;
 
-    NSString *urlString = [NSString stringWithFormat:@"%s%s", MODEL_ENDPOINT.c_str(), API_KEY.c_str()];
+    NSString *urlString = [NSString stringWithFormat:@"%s%s", MODEL_ENDPOINT.c_str(), g_apiKey.c_str()];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     request.HTTPMethod = @"POST";
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -302,6 +304,16 @@ public:
 
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
+        // --- 核心逻辑：解析命令行参数 ---
+        if (argc > 1) {
+            // 将第一个参数作为 API Key
+            g_apiKey = argv[1];
+            printf("[Config] Using API Key from command line: %s\n", g_apiKey.c_str());
+        } else {
+            printf("[Config] No command line key provided. Using default.\n");
+        }
+        // ---------------------------
+
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
         AppDelegate *delegate = [AppDelegate new];
