@@ -13,78 +13,31 @@
 #import <Cocoa/Cocoa.h>
 #import <Foundation/Foundation.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
-#include <string>
-#include <vector>
 
 // ==========================================
-// 1. 配置区域
+// 1. 全局配置
 // ==========================================
 
-// 默认 API Key (如果在命令行没提供，则使用这个)
-std::string g_apiKey = "key"; 
+static NSString *g_apiKey = @"key"; 
 
-const bool USE_PROXY = false;
-const std::string PROXY_HOST = "127.0.0.1";
+const BOOL USE_PROXY = NO;
+NSString *const PROXY_HOST = @"127.0.0.1";
 const int PROXY_PORT = 7890; 
 
-const std::string MODEL_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
+// 使用最新的 Gemini 2.0 Flash 模型以获得更好的性能
+NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
 
 // ==========================================
-// 2. C++ 逻辑层
+// 2. UI 控制器
 // ==========================================
 
-struct ChatMessage {
-    std::string role; 
-    std::string text;
-};
-
-class GeminiClient {
-public:
-    static std::string escapeJSON(const std::string& input) {
-        std::string output;
-        output.reserve(input.length() + 20);
-        for (char c : input) {
-            switch (c) {
-                case '"':  output += "\\\""; break;
-                case '\\': output += "\\\\"; break;
-                case '\b': output += "\\b"; break;
-                case '\f': output += "\\f"; break;
-                case '\n': output += "\\n"; break;
-                case '\r': output += "\\r"; break;
-                case '\t': output += "\\t"; break;
-                default:   output += c;     break;
-            }
-        }
-        return output;
-    }
-
-    static NSString* buildRequestBody(const std::vector<ChatMessage>& history) {
-        std::string json = "{\"contents\": [";
-        for (size_t i = 0; i < history.size(); ++i) {
-            const auto& msg = history[i];
-            json += "{\"role\": \"";
-            json += msg.role;
-            json += "\", \"parts\": [{\"text\": \"";
-            json += escapeJSON(msg.text);
-            json += "\"}]}";
-            if (i < history.size() - 1) json += ",";
-        }
-        json += "]}";
-        return [NSString stringWithUTF8String:json.c_str()];
-    }
-};
-
-// ==========================================
-// 3. UI 控制器
-// ==========================================
-
-@interface MainWindowController : NSWindowController {
-    std::vector<ChatMessage> _chatHistory; 
-}
+@interface MainWindowController : NSWindowController 
+@property (strong) NSMutableArray<NSDictionary *> *chatHistory; // 存储对话历史
 @property (strong) NSTextView *outputTextView;
 @property (strong) NSTextField *inputField;
 @property (strong) NSButton *sendButton;
 @property (strong) NSButton *uploadButton;
+@property (strong) NSURLSession *session; // 复用 Session
 @end
 
 @implementation MainWindowController
@@ -93,21 +46,34 @@ public:
     NSRect frame = NSMakeRect(0, 0, 900, 700);
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     NSWindow *window = [[NSWindow alloc] initWithContentRect:frame styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    window.title = @"Native Gemini (Command Line Key Support)";
+    window.title = @"Native Gemini (High Performance)";
     window.minSize = NSMakeSize(600, 500);
     [window center];
     
     self = [super initWithWindow:window];
     if (self) {
+        _chatHistory = [NSMutableArray array];
+        [self setupNetworkSession];
         [self setupUI];
-        [self showCurrentKeyInfo];
     }
     return self;
 }
 
-- (void)showCurrentKeyInfo {
-    NSString *info = (g_apiKey == "Key") ? @"[System] Using default API Key from code." : @"[System] Using API Key from command line.";
-    [self appendLog:info color:[NSColor systemGrayColor]];
+- (void)setupNetworkSession {
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    if (USE_PROXY) {
+        // 使用现代字符串 Key 消除弃用警告
+        config.connectionProxyDictionary = @{
+            @"HTTPEnable":  @YES,
+            @"HTTPProxy":   PROXY_HOST,
+            @"HTTPPort":    @(PROXY_PORT),
+            @"HTTPSEnable": @YES,
+            @"HTTPSProxy":  PROXY_HOST,
+            @"HTTPSPort":   @(PROXY_PORT)
+        };
+    }
+    // 复用 Session 以利用 HTTP Keep-Alive 减少握手延迟
+    self.session = [NSURLSession sessionWithConfiguration:config];
 }
 
 - (void)setupUI {
@@ -162,50 +128,49 @@ public:
     });
 }
 
+- (void)addToHistoryWithRole:(NSString *)role text:(NSString *)text {
+    // 构造 Gemini 要求的 JSON 结构：{"role":"...", "parts":[{"text":"..."}]}
+    [_chatHistory addObject:@{
+        @"role": role,
+        @"parts": @[@{@"text": text}]
+    }];
+}
+
 - (void)onClearClicked {
-    _chatHistory.clear();
+    [_chatHistory removeAllObjects];
     self.outputTextView.string = @"";
-    [self appendLog:@"[System] Chat history cleared from RAM." color:[NSColor systemGrayColor]];
+    [self appendLog:@"[System] Chat history cleared." color:[NSColor systemGrayColor]];
 }
 
 - (void)onUploadClicked {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
-    panel.canChooseFiles = YES;
-    panel.canChooseDirectories = NO;
-
     if (@available(macOS 12.0, *)) {
-        NSMutableArray<UTType *> *types = [NSMutableArray array];
-        [types addObject:UTTypePlainText];
-        [types addObject:UTTypeSourceCode];
-        [types addObject:UTTypeJSON];
-        UTType *mdType = [UTType typeWithFilenameExtension:@"md"];
-        if (mdType) [types addObject:mdType];
-        panel.allowedContentTypes = types;
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        panel.allowedFileTypes = @[@"txt", @"md", @"cpp", @"h", @"py", @"json", @"log"];
-#pragma clang diagnostic pop
+        panel.allowedContentTypes = @[UTTypePlainText, UTTypeSourceCode, UTTypeJSON];
     }
-    
+
     [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
         if (result == NSModalResponseOK) {
             NSURL *url = [[panel URLs] firstObject];
-            NSError *error;
-            NSString *content = [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:&error];
             
-            if (error) {
-                [self appendLog:[@"Error reading file: " stringByAppendingString:error.localizedDescription] color:[NSColor systemRedColor]];
-                return;
-            }
-            
-            NSString *fileName = [url lastPathComponent];
-            [self appendLog:[NSString stringWithFormat:@"[File: %@ Uploaded]", fileName] color:[NSColor systemGreenColor]];
-            
-            std::string prompt = "Uploaded File Content (" + std::string([fileName UTF8String]) + "):\n---\n" + [content UTF8String] + "\n---\nPlease summarize this file.";
-            _chatHistory.push_back({"user", prompt});
-            
-            [self callGeminiAPI];
+            // 性能优化：在后台线程读取文件，避免阻塞 UI
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                NSError *error;
+                NSString *content = [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:&error];
+                
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (error) {
+                        [self appendLog:[@"Error reading file: " stringByAppendingString:error.localizedDescription] color:[NSColor systemRedColor]];
+                        return;
+                    }
+                    
+                    NSString *fileName = [url lastPathComponent];
+                    [self appendLog:[NSString stringWithFormat:@"[File: %@ Uploaded]", fileName] color:[NSColor systemGreenColor]];
+                    
+                    NSString *prompt = [NSString stringWithFormat:@"Uploaded File Content (%@):\n---\n%@\n---\nPlease summarize this file.", fileName, content];
+                    [self addToHistoryWithRole:@"user" text:prompt];
+                    [self callGeminiAPI];
+                });
+            });
         }
     }];
 }
@@ -213,56 +178,54 @@ public:
 - (void)onSendClicked {
     NSString *prompt = self.inputField.stringValue;
     if (prompt.length == 0) return;
+    
     [self appendLog:[NSString stringWithFormat:@"You: %@", prompt] color:[NSColor systemBlueColor]];
-    _chatHistory.push_back({"user", [prompt UTF8String]});
+    [self addToHistoryWithRole:@"user" text:prompt];
     self.inputField.stringValue = @"";
     [self callGeminiAPI];
 }
 
 - (void)callGeminiAPI {
-    // 检查 Key 是否有效
-    if (g_apiKey == "Key" || g_apiKey.empty()) {
-        [self appendLog:@"[Error] API Key not set. Please provide it via command line: ./GeminiApp YOUR_KEY" color:[NSColor systemRedColor]];
-        self.sendButton.enabled = YES;
-        return;
-    }
-
     self.sendButton.enabled = NO;
     self.uploadButton.enabled = NO;
 
-    NSString *urlString = [NSString stringWithFormat:@"%s%s", MODEL_ENDPOINT.c_str(), g_apiKey.c_str()];
+    NSString *urlString = [MODEL_ENDPOINT stringByAppendingString:g_apiKey];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     request.HTTPMethod = @"POST";
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    request.HTTPBody = [GeminiClient::buildRequestBody(_chatHistory) dataUsingEncoding:NSUTF8StringEncoding];
-    
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    if (USE_PROXY) {
-        NSString *host = [NSString stringWithUTF8String:PROXY_HOST.c_str()];
-        NSNumber *port = [NSNumber numberWithInt:PROXY_PORT];
-        config.connectionProxyDictionary = @{ @"HTTPEnable":@YES, @"HTTPProxy":host, @"HTTPPort":port, @"HTTPSEnable":@YES, @"HTTPSProxy":host, @"HTTPSPort":port };
-    }
-    
-    [[[NSURLSession sessionWithConfiguration:config] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+
+    // 性能优化：直接使用系统级序列化，自动处理字符转义，效率极高
+    NSDictionary *payload = @{@"contents": _chatHistory};
+    NSData *httpBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    request.HTTPBody = httpBody;
+
+    [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             self.sendButton.enabled = YES;
             self.uploadButton.enabled = YES;
+            
             if (error) {
                 [self appendLog:[@"Network Error: " stringByAppendingString:error.localizedDescription] color:[NSColor systemRedColor]];
                 return;
             }
+
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            
+            // 防御性编程：安全解析嵌套的 JSON
             if (json[@"error"]) {
                 [self appendLog:[NSString stringWithFormat:@"API Error: %@", json[@"error"][@"message"]] color:[NSColor systemRedColor]];
-            } else if (json[@"candidates"]) {
+            } else {
                 @try {
-                    NSString *text = json[@"candidates"][0][@"content"][@"parts"][0][@"text"];
-                    if (text) {
-                        [self appendLog:[NSString stringWithFormat:@"Gemini: %@", text] color:[NSColor labelColor]];
-                        _chatHistory.push_back({"model", [text UTF8String]});
+                    NSArray *candidates = json[@"candidates"];
+                    if (candidates.count > 0) {
+                        NSString *text = candidates[0][@"content"][@"parts"][0][@"text"];
+                        if (text) {
+                            [self appendLog:[NSString stringWithFormat:@"Gemini: %@", text] color:[NSColor labelColor]];
+                            [self addToHistoryWithRole:@"model" text:text];
+                        }
                     }
                 } @catch (NSException *e) {
-                    [self appendLog:@"Unexpected JSON format." color:[NSColor systemOrangeColor]];
+                    [self appendLog:@"[Error] Unexpected response format from API." color:[NSColor systemOrangeColor]];
                 }
             }
         });
@@ -271,7 +234,7 @@ public:
 @end
 
 // ==========================================
-// 4. App Delegate & Main
+// 3. App Delegate & Main
 // ==========================================
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -280,6 +243,7 @@ public:
 
 @implementation AppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)a {
+    // 设置简单的菜单
     NSMenu *menubar = [NSMenu new];
     NSMenuItem *appMenuItem = [NSMenuItem new];
     [menubar addItem:appMenuItem];
@@ -304,15 +268,10 @@ public:
 
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
-        // --- 核心逻辑：解析命令行参数 ---
         if (argc > 1) {
-            // 将第一个参数作为 API Key
-            g_apiKey = argv[1];
-            printf("[Config] Using API Key from command line: %s\n", g_apiKey.c_str());
-        } else {
-            printf("[Config] No command line key provided. Using default.\n");
+            g_apiKey = [NSString stringWithUTF8String:argv[1]];
+            printf("[Config] Using API Key from command line.\n");
         }
-        // ---------------------------
 
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
