@@ -1,7 +1,11 @@
 /*
  ===========================================================================
  运行环境: macOS 15.0+ (Sequoia)
- 优化目标: 修复全屏布局与文字复制, 去除图标简化UI, 尽量使用Metal GPU渲染， 尽量降低CPU的占用率达到省电，所有缓存走运行内存，不要写入到磁盘
+ 优化目标: 
+ 1. 修复编译错误 (NSOpenPanel)
+ 2. 零磁盘缓存：所有网络请求、Cookie、窗口状态均只驻留在内存。
+ 3. 低功耗：利用 Metal GPU 进行毛玻璃渲染。
+ 4. 交互：支持 Cmd+C/V/A。
  编译命令: 
  clang++ -O3 -flto -fobjc-arc -framework Cocoa -framework Foundation -framework QuartzCore -framework UniformTypeIdentifiers main.mm -o GeminiApp
  ===========================================================================
@@ -19,18 +23,16 @@ static NSString *g_apiKey = @"YOUR_API_KEY_HERE";
 const BOOL USE_PROXY = NO;
 NSString *const PROXY_HOST = @"127.0.0.1";
 const int PROXY_PORT = 7890; 
-// 建议使用正式模型名如 gemini-1.5-flash
 NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=";
 
 // ==========================================
-// 2. UI 控制器
+// 2. 核心 UI 控制器
 // ==========================================
-@interface MainWindowController : NSWindowController 
+@interface MainWindowController : NSWindowController <NSWindowDelegate>
 @property (strong) NSMutableArray<NSDictionary *> *chatHistory;
 @property (strong) NSTextView *outputTextView;
 @property (strong) NSTextField *inputField;
 @property (strong) NSButton *sendButton;
-@property (strong) NSButton *uploadButton;
 @property (strong) NSURLSession *session;
 @property (strong) id activityToken;
 @end
@@ -38,28 +40,45 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
 @implementation MainWindowController
 
 - (instancetype)init {
-    NSRect frame = NSMakeRect(0, 0, 900, 700);
+    NSRect frame = NSMakeRect(0, 0, 900, 720);
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView;
     
     NSWindow *window = [[NSWindow alloc] initWithContentRect:frame styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    window.title = @"Gemini Native";
+    window.title = @"Gemini RAM-Only";
     window.titlebarAppearsTransparent = YES;
     window.backgroundColor = [NSColor clearColor]; 
-    window.opaque = NO; 
-    window.minSize = NSMakeSize(600, 400);
-    [window center];
+    window.hasShadow = YES;
+    window.releasedWhenClosed = YES;
     
+    // [内存优化] 彻底禁用窗口状态自动保存到磁盘
+    window.restorable = NO;
+    window.identifier = nil; 
+
     self = [super initWithWindow:window];
     if (self) {
         _chatHistory = [NSMutableArray array];
         [self setupNetworkSession];
         [self setupUI];
+        window.delegate = self;
     }
     return self;
 }
 
 - (void)setupNetworkSession {
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    // [内存优化] 使用临时会话，数据仅保留在内存
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    
+    // 强制禁用磁盘缓存
+    config.URLCache = [[NSURLCache alloc] initWithMemoryCapacity:128 * 1024 * 1024 
+                                                     diskCapacity:0 
+                                                         diskPath:nil];
+    
+    config.HTTPCookieStorage = nil; 
+    config.URLCredentialStorage = nil;
+    config.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyNever;
+    // 强制不读取本地缓存，不写入本地缓存
+    config.requestCachePolicy = NSURLRequestReloadIgnoringLocalAndRemoteCacheData;
+
     if (USE_PROXY) {
         config.connectionProxyDictionary = @{
             @"HTTPEnable": @YES, @"HTTPProxy": PROXY_HOST, @"HTTPPort": @(PROXY_PORT),
@@ -71,9 +90,8 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
 
 - (void)setupUI {
     NSView *containerView = self.window.contentView;
-    containerView.wantsLayer = YES;
+    containerView.wantsLayer = YES; 
 
-    // 背景模糊层 (GPU 加速)
     NSVisualEffectView *vibrantView = [[NSVisualEffectView alloc] initWithFrame:containerView.bounds];
     vibrantView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     vibrantView.material = NSVisualEffectMaterialUnderWindowBackground; 
@@ -81,62 +99,50 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
     vibrantView.state = NSVisualEffectStateActive;
     [containerView addSubview:vibrantView];
 
-    // 1. 滚动区域
-    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 85, 860, 580)];
+    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 100, 860, 560)];
     scrollView.hasVerticalScroller = YES;
     scrollView.borderType = NSNoBorder;
     scrollView.drawsBackground = NO;
     scrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     
-    // 2. 文本显示区 (关键修复：selectable = YES)
     self.outputTextView = [[NSTextView alloc] initWithFrame:scrollView.bounds];
     self.outputTextView.editable = NO;
-    self.outputTextView.selectable = YES; // 允许选中复制
-    self.outputTextView.font = [NSFont systemFontOfSize:14];
+    self.outputTextView.selectable = YES; 
+    self.outputTextView.font = [NSFont systemFontOfSize:15];
     self.outputTextView.textColor = [NSColor labelColor];
     self.outputTextView.drawsBackground = NO;
     self.outputTextView.verticallyResizable = YES;
     self.outputTextView.horizontallyResizable = NO;
     self.outputTextView.autoresizingMask = NSViewWidthSizable;
     self.outputTextView.textContainer.widthTracksTextView = YES;
+    self.outputTextView.textContainerInset = NSMakeSize(10, 10);
     
     scrollView.documentView = self.outputTextView;
     [vibrantView addSubview:scrollView]; 
     
-    // 3. 底部控制栏
-    CGFloat bottomMargin = 25;
-    CGFloat buttonHeight = 32;
-    CGFloat spacing = 10;
+    CGFloat bottomPos = 30;
     
-    // Send 按钮
     self.sendButton = [NSButton buttonWithTitle:@"Send" target:self action:@selector(onSendClicked)];
     self.sendButton.bezelStyle = NSBezelStyleRounded;
-    self.sendButton.keyEquivalent = @"\r"; // 回车触发
-    NSRect sendFrame = NSMakeRect(NSWidth(containerView.bounds) - 100, bottomMargin, 80, buttonHeight);
-    self.sendButton.frame = sendFrame;
+    self.sendButton.keyEquivalent = @"\r"; 
+    self.sendButton.frame = NSMakeRect(NSWidth(containerView.bounds) - 100, bottomPos, 80, 32);
     self.sendButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [vibrantView addSubview:self.sendButton];
     
-    // Clear 按钮
     NSButton *clearBtn = [NSButton buttonWithTitle:@"Clear" target:self action:@selector(onClearClicked)];
     clearBtn.bezelStyle = NSBezelStyleRounded;
-    NSRect clearFrame = NSMakeRect(sendFrame.origin.x - 70 - spacing, bottomMargin, 70, buttonHeight);
-    clearBtn.frame = clearFrame;
+    clearBtn.frame = NSMakeRect(NSWidth(containerView.bounds) - 180, bottomPos, 70, 32);
     clearBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [vibrantView addSubview:clearBtn];
     
-    // Upload 按钮
-    self.uploadButton = [NSButton buttonWithTitle:@"Upload" target:self action:@selector(onUploadClicked)];
-    self.uploadButton.bezelStyle = NSBezelStyleRounded;
-    NSRect uploadFrame = NSMakeRect(clearFrame.origin.x - 80 - spacing, bottomMargin, 80, buttonHeight);
-    self.uploadButton.frame = uploadFrame;
-    self.uploadButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [vibrantView addSubview:self.uploadButton];
+    NSButton *upBtn = [NSButton buttonWithTitle:@"Upload" target:self action:@selector(onUploadClicked)];
+    upBtn.bezelStyle = NSBezelStyleRounded;
+    upBtn.frame = NSMakeRect(NSWidth(containerView.bounds) - 265, bottomPos, 80, 32);
+    upBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [vibrantView addSubview:upBtn];
     
-    // 输入框
-    CGFloat inputWidth = uploadFrame.origin.x - 20 - spacing;
-    self.inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(20, bottomMargin, inputWidth, buttonHeight)];
-    self.inputField.placeholderString = @"Type message here...";
+    self.inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(20, bottomPos, NSWidth(containerView.bounds) - 295, 32)];
+    self.inputField.placeholderString = @"Ask Gemini (No-Disk Mode)...";
     self.inputField.font = [NSFont systemFontOfSize:14];
     self.inputField.bezelStyle = NSTextFieldRoundedBezel;
     self.inputField.target = self;
@@ -145,12 +151,10 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
     [vibrantView addSubview:self.inputField];
 }
 
-- (void)appendLog:(NSString *)text color:(NSColor *)color {
+- (void)appendLog:(NSString *)text color:(NSColor *)color isBold:(BOOL)isBold {
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSDictionary *attrs = @{
-            NSForegroundColorAttributeName: color,
-            NSFontAttributeName: [NSFont systemFontOfSize:14]
-        };
+        NSFont *font = isBold ? [NSFont boldSystemFontOfSize:15] : [NSFont systemFontOfSize:15];
+        NSDictionary *attrs = @{ NSForegroundColorAttributeName: color, NSFontAttributeName: font };
         NSAttributedString *as = [[NSAttributedString alloc] initWithString:[text stringByAppendingString:@"\n\n"] attributes:attrs];
         [self.outputTextView.textStorage appendAttributedString:as];
         [self.outputTextView scrollRangeToVisible:NSMakeRange(self.outputTextView.textStorage.length, 0)];
@@ -165,32 +169,34 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
     request.HTTPMethod = @"POST";
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    // 增加头部指令：告诉所有中继和系统不要存储此请求
+    [request setValue:@"no-store, no-cache, must-revalidate" forHTTPHeaderField:@"Cache-Control"];
 
     NSDictionary *payload = @{@"contents": self.chatHistory};
     request.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
 
     [[self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (self.activityToken) {
-            [[NSProcessInfo processInfo] endActivity:self.activityToken];
-            self.activityToken = nil;
-        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.sendButton.enabled = YES;
+            if (self.activityToken) {
+                [[NSProcessInfo processInfo] endActivity:self.activityToken];
+                self.activityToken = nil;
+            }
+        });
 
         if (data) {
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             @try {
                 NSString *resText = json[@"candidates"][0][@"content"][@"parts"][0][@"text"];
                 if (resText) {
-                    [self appendLog:[@"Gemini: " stringByAppendingString:resText] color:[NSColor labelColor]];
+                    [self appendLog:@"Gemini:" color:[NSColor labelColor] isBold:YES];
+                    [self appendLog:resText color:[NSColor labelColor] isBold:NO];
                     [self addToHistoryWithRole:@"model" text:resText];
                 }
             } @catch (NSException *e) {
-                [self appendLog:@"[Error: Invalid response from API]" color:[NSColor systemRedColor]];
+                [self appendLog:@"[Error]: Failed to parse API." color:[NSColor systemRedColor] isBold:NO];
             }
         }
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.sendButton.enabled = YES;
-        });
     }] resume];
 }
 
@@ -206,7 +212,8 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
 - (void)onSendClicked {
     NSString *prompt = self.inputField.stringValue;
     if (prompt.length == 0) return;
-    [self appendLog:[@"You: " stringByAppendingString:prompt] color:[NSColor systemBlueColor]];
+    [self appendLog:@"You:" color:[NSColor systemBlueColor] isBold:YES];
+    [self appendLog:prompt color:[NSColor labelColor] isBold:NO];
     [self addToHistoryWithRole:@"user" text:prompt];
     self.inputField.stringValue = @"";
     [self callGeminiAPI];
@@ -214,13 +221,14 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
 
 - (void)onUploadClicked {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
-    panel.allowedContentTypes = @[UTTypePlainText, UTTypeSourceCode];
+    panel.allowedContentTypes = @[UTTypePlainText, UTTypeSourceCode, UTTypeJSON];
+    // 默认即不添加到最近文档 (仅在 NSDocument 应用中自动添加)
     [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse result) {
         if (result == NSModalResponseOK) {
             NSURL *url = [panel URLs].firstObject;
             NSString *content = [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:nil];
             if (content) {
-                [self appendLog:[NSString stringWithFormat:@"[File: %@]", url.lastPathComponent] color:[NSColor systemGreenColor]];
+                [self appendLog:[NSString stringWithFormat:@"[File Uploaded: %@]", url.lastPathComponent] color:[NSColor systemGreenColor] isBold:YES];
                 [self addToHistoryWithRole:@"user" text:content];
                 [self callGeminiAPI];
             }
@@ -230,40 +238,40 @@ NSString *const MODEL_ENDPOINT = @"https://generativelanguage.googleapis.com/v1b
 @end
 
 // ==========================================
-// 3. App Delegate (添加菜单栏支持)
+// 3. App Delegate
 // ==========================================
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property (strong) MainWindowController *mwc;
 @end
 
 @implementation AppDelegate
+- (void)applicationDidFinishLaunching:(NSNotification *)a {
+    // 彻底禁用系统的状态恢复功能
+    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"NSQuitAlwaysKeepsWindows"];
+    
+    [self setupMenuBar];
+    self.mwc = [[MainWindowController alloc] init];
+    [self.mwc showWindow:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
 
 - (void)setupMenuBar {
     NSMenu *mainMenu = [[NSMenu alloc] init];
-    
-    // 1. App Menu
     NSMenuItem *appMenuItem = [mainMenu addItemWithTitle:@"App" action:nil keyEquivalent:@""];
     NSMenu *appMenu = [[NSMenu alloc] init];
     [appMenu addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
     [appMenuItem setSubmenu:appMenu];
     
-    // 2. Edit Menu (关键：有了这个 Cmd+C 才能生效)
     NSMenuItem *editMenuItem = [mainMenu addItemWithTitle:@"Edit" action:nil keyEquivalent:@""];
     NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
     [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
     [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
     [editMenuItem setSubmenu:editMenu];
-    
     [NSApp setMainMenu:mainMenu];
 }
 
-- (void)applicationDidFinishLaunching:(NSNotification *)a {
-    [self setupMenuBar];
-    self.mwc = [[MainWindowController alloc] init];
-    [self.mwc showWindow:nil];
-    [NSApp activateIgnoringOtherApps:YES];
-}
+- (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app { return NO; }
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return YES; }
 @end
 
@@ -278,3 +286,4 @@ int main(int argc, const char * argv[]) {
     }
     return 0;
 }
+
