@@ -1,7 +1,7 @@
 /*
  ===========================================================================
  运行环境: macOS 15.0+ (Sequoia)
- 优化目标: 修复全屏布局与文字复制, 去除图标简化UI, 保持 Metal GPU 极低功耗
+ 优化目标: 修复全屏布局与文字复制, 去除图标简化UI, 尽量使用Metal GPU渲染， 尽量降低CPU的占用率达到省电
  编译命令: 
  clang++ -O3 -flto -fobjc-arc -framework Cocoa -framework Foundation -framework QuartzCore -framework UniformTypeIdentifiers main.mm -o GeminiApp
  ===========================================================================
